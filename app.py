@@ -10,6 +10,15 @@ import re
 import warnings
 warnings.filterwarnings('ignore')
 
+# Create embedding dictionary
+embedding_dict = {str(row['incident_id']).strip(): row['embedding'] 
+                  for _, row in df_parquet.iterrows()}
+
+# Add embeddings to Excel data
+df_excel['embedding'] = df_excel['incident_id'].apply(
+    lambda x: embedding_dict.get(str(x).strip(), None)
+)
+
 # ============================================================================
 # STEP 1: Load Data from Excel and Parquet
 # ============================================================================
