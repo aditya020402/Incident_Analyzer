@@ -4,10 +4,8 @@ from pathlib import Path
 from sklearn.preprocessing import normalize
 import umap
 import hdbscan
-from bertopic import BERTopic
 from sklearn.cluster import DBSCAN
 from scipy.spatial.distance import cdist
-from scipy.cluster.hierarchy import linkage, fcluster
 import re
 import warnings
 warnings.filterwarnings('ignore')
@@ -73,11 +71,11 @@ embeddings_normalized = normalize(embeddings)
 print(f"Embedding shape: {embeddings.shape}")
 
 # ============================================================================
-# STEP 4: Initial Clustering with HDBSCAN
+# STEP 1: HDBSCAN Clustering
 # ============================================================================
 
 print("\n" + "="*80)
-print("STEP 1: INITIAL CLUSTERING WITH HDBSCAN")
+print("STEP 1: HDBSCAN CLUSTERING")
 print("="*80)
 
 umap_model = umap.UMAP(
@@ -92,187 +90,299 @@ umap_model = umap.UMAP(
 embeddings_reduced = umap_model.fit_transform(embeddings_normalized)
 
 hdbscan_model = hdbscan.HDBSCAN(
-    min_cluster_size=10,         # Moderate size to avoid over-fragmentation
-    min_samples=3,
+    min_cluster_size=15,
+    min_samples=5,
     metric='euclidean',
-    cluster_selection_method='eom',  # eom is more stable
+    cluster_selection_method='eom',
     prediction_data=True,
     core_dist_n_jobs=-1,
     cluster_selection_epsilon=0.0
 )
 
-initial_labels = hdbscan_model.fit_predict(embeddings_reduced)
-n_initial_clusters = len(set(initial_labels)) - (1 if -1 in initial_labels else 0)
-n_initial_outliers = (initial_labels == -1).sum()
+hdbscan_labels = hdbscan_model.fit_predict(embeddings_reduced)
+n_hdbscan_clusters = len(set(hdbscan_labels)) - (1 if -1 in hdbscan_labels else 0)
+n_hdbscan_outliers = (hdbscan_labels == -1).sum()
 
-print(f"Initial clusters: {n_initial_clusters}")
-print(f"Initial outliers: {n_initial_outliers} ({n_initial_outliers/len(initial_labels)*100:.1f}%)")
+print(f"HDBSCAN found {n_hdbscan_clusters} clusters")
+print(f"HDBSCAN outliers: {n_hdbscan_outliers} ({n_hdbscan_outliers/len(hdbscan_labels)*100:.1f}%)")
 
-# ============================================================================
-# STEP 5: MERGE SIMILAR CLUSTERS
-# ============================================================================
-
-print("\n" + "="*80)
-print("STEP 2: MERGING SIMILAR CLUSTERS")
-print("="*80)
-
-# Calculate cluster centroids
-cluster_ids = [c for c in set(initial_labels) if c != -1]
-cluster_centroids = {}
-cluster_sizes = {}
-
-for cluster_id in cluster_ids:
-    mask = initial_labels == cluster_id
-    cluster_centroids[cluster_id] = embeddings_reduced[mask].mean(axis=0)
-    cluster_sizes[cluster_id] = mask.sum()
-
-print(f"Calculating similarity between {len(cluster_ids)} clusters...")
-
-# Calculate pairwise distances between cluster centroids
-centroid_matrix = np.array([cluster_centroids[cid] for cid in cluster_ids])
-centroid_distances = cdist(centroid_matrix, centroid_matrix, metric='euclidean')
-
-# Define similarity threshold (tune this based on your data)
-similarity_threshold = 0.8  # Clusters closer than this will be merged
-
-# Use hierarchical clustering to merge similar clusters
-from scipy.cluster.hierarchy import linkage, fcluster
-
-# Perform hierarchical clustering on cluster centroids
-linkage_matrix = linkage(centroid_matrix, method='average', metric='euclidean')
-
-# Cut the dendrogram at similarity threshold
-merged_cluster_labels = fcluster(linkage_matrix, t=similarity_threshold, criterion='distance')
-
-# Create mapping from old cluster IDs to new merged cluster IDs
-cluster_id_mapping = {}
-for idx, old_cluster_id in enumerate(cluster_ids):
-    new_cluster_id = merged_cluster_labels[idx] - 1  # Convert to 0-indexed
-    cluster_id_mapping[old_cluster_id] = new_cluster_id
-
-# Apply mapping to all labels
-merged_labels = initial_labels.copy()
-for old_id, new_id in cluster_id_mapping.items():
-    merged_labels[merged_labels == old_id] = new_id
-
-n_merged_clusters = len(set(merged_labels)) - (1 if -1 in merged_labels else 0)
-print(f"After merging: {n_merged_clusters} clusters (reduced from {n_initial_clusters})")
-print(f"Merged {n_initial_clusters - n_merged_clusters} duplicate clusters")
+# Initialize final labels
+final_labels = hdbscan_labels.copy()
+max_hdbscan_label = hdbscan_labels.max()
 
 # ============================================================================
-# STEP 6: STRICT KNN VOTING FOR VERY CLOSE OUTLIERS ONLY
+# STEP 2: KNN Voting with Median Intra-Cluster Distance Threshold
 # ============================================================================
 
 print("\n" + "="*80)
-print("STEP 3: KNN ASSIGNMENT FOR VERY CLOSE OUTLIERS ONLY")
+print("STEP 2: KNN VOTING (MEDIAN INTRA-CLUSTER DISTANCE)")
 print("="*80)
 
-final_labels = merged_labels.copy()
-outlier_mask = final_labels == -1
-n_outliers_before = outlier_mask.sum()
+outlier_mask_knn = final_labels == -1
+n_outliers_for_knn = outlier_mask_knn.sum()
 
-if n_outliers_before > 0:
-    outlier_indices = np.where(outlier_mask)[0]
-    outlier_embeddings = embeddings_reduced[outlier_mask]
+if n_outliers_for_knn > 0:
+    print(f"Attempting KNN assignment for {n_outliers_for_knn} outliers...")
+    
+    outlier_indices = np.where(outlier_mask_knn)[0]
+    outlier_embeddings = embeddings_reduced[outlier_mask_knn]
     
     # Get clustered points
     clustered_mask = final_labels != -1
     clustered_embeddings = embeddings_reduced[clustered_mask]
     clustered_labels = final_labels[clustered_mask]
     
-    # Calculate distances from each outlier to all clustered points
-    distances = cdist(outlier_embeddings, clustered_embeddings, metric='euclidean')
-    
-    # Define STRICT distance threshold - only assign if very close
-    # Use 10th percentile of intra-cluster distances as threshold
+    # Calculate median intra-cluster distance
+    print("Calculating median intra-cluster distance...")
     intra_cluster_distances = []
+    
     for cluster_id in set(clustered_labels):
-        cluster_points = embeddings_reduced[final_labels == cluster_id]
+        cluster_mask = final_labels == cluster_id
+        cluster_points = embeddings_reduced[cluster_mask]
+        
         if len(cluster_points) > 1:
             cluster_center = cluster_points.mean(axis=0)
             dists = np.linalg.norm(cluster_points - cluster_center, axis=1)
             intra_cluster_distances.extend(dists)
     
-    distance_threshold = np.percentile(intra_cluster_distances, 50)  # 50th percentile = median
-    print(f"Distance threshold for KNN assignment: {distance_threshold:.4f}")
+    # Use MEDIAN as threshold
+    distance_threshold = np.median(intra_cluster_distances)
+    print(f"Median intra-cluster distance (threshold): {distance_threshold:.4f}")
+    
+    # Calculate distances from outliers to all clustered points
+    distances = cdist(outlier_embeddings, clustered_embeddings, metric='euclidean')
     
     assigned_count = 0
+    k = 5  # Number of neighbors for voting
     
     for i, outlier_idx in enumerate(outlier_indices):
         # Find k nearest neighbors
-        k = 5
         nearest_k_indices = np.argsort(distances[i])[:k]
         nearest_k_distances = distances[i][nearest_k_indices]
         
-        # Only assign if closest neighbor is within threshold
+        # Only assign if closest neighbor is within median threshold
         if nearest_k_distances[0] <= distance_threshold:
             # Get labels of k nearest neighbors
             neighbor_labels = clustered_labels[nearest_k_indices]
             
-            # Assign to most common cluster
+            # Majority voting among k neighbors
             unique, counts = np.unique(neighbor_labels, return_counts=True)
             assigned_cluster = unique[np.argmax(counts)]
             
             final_labels[outlier_idx] = assigned_cluster
             assigned_count += 1
     
-    print(f"Assigned {assigned_count} close outliers to nearest clusters")
-    print(f"Remaining outliers: {(final_labels == -1).sum()}")
+    print(f"KNN assigned {assigned_count} outliers to existing clusters")
+    print(f"Remaining outliers after KNN: {(final_labels == -1).sum()}")
 
 # ============================================================================
-# STEP 7: DBSCAN FOR REMAINING OUTLIERS
+# STEP 3: DBSCAN on Remaining Outliers
 # ============================================================================
 
 print("\n" + "="*80)
-print("STEP 4: DBSCAN FOR REMAINING OUTLIERS")
+print("STEP 3: DBSCAN ON REMAINING OUTLIERS")
 print("="*80)
 
-remaining_outliers = (final_labels == -1).sum()
+outlier_mask_dbscan = final_labels == -1
+n_outliers_for_dbscan = outlier_mask_dbscan.sum()
 
-if remaining_outliers > 0:
-    print(f"Clustering {remaining_outliers} remaining outliers with DBSCAN...")
+if n_outliers_for_dbscan > 0:
+    print(f"Clustering {n_outliers_for_dbscan} remaining outliers with DBSCAN...")
     
-    outlier_mask = final_labels == -1
-    outlier_embeddings_remain = embeddings_reduced[outlier_mask]
+    outlier_embeddings = embeddings_reduced[outlier_mask_dbscan]
+    outlier_indices = np.where(outlier_mask_dbscan)[0]
     
-    # Use DBSCAN with moderate settings
+    # DBSCAN with moderate settings
     dbscan = DBSCAN(
-        eps=1.2,           # Distance threshold
-        min_samples=3,     # Minimum 3 points to form cluster
+        eps=1.5,
+        min_samples=3,
         metric='euclidean',
         n_jobs=-1
     )
     
-    dbscan_labels = dbscan.fit_predict(outlier_embeddings_remain)
+    dbscan_labels = dbscan.fit_predict(outlier_embeddings)
     
-    # Count how many were clustered
-    n_dbscan_outliers = (dbscan_labels == -1).sum()
+    # Count DBSCAN results
     n_dbscan_clusters = len(set(dbscan_labels)) - (1 if -1 in dbscan_labels else 0)
+    n_dbscan_outliers = (dbscan_labels == -1).sum()
     
     print(f"DBSCAN found {n_dbscan_clusters} new clusters")
-    print(f"DBSCAN still marked {n_dbscan_outliers} as outliers")
+    print(f"DBSCAN still marked {n_dbscan_outliers} as final outliers")
     
-    # Offset labels to avoid collision with existing clusters
-    max_label = final_labels[final_labels != -1].max()
+    # Offset DBSCAN labels to avoid collision with HDBSCAN clusters
     dbscan_labels_offset = dbscan_labels.copy()
-    dbscan_labels_offset[dbscan_labels_offset != -1] += max_label + 1
+    dbscan_labels_offset[dbscan_labels_offset != -1] += max_hdbscan_label + 1
     
     # Update final labels
-    final_labels[outlier_mask] = dbscan_labels_offset
-
-# ============================================================================
-# STEP 8: Calculate Final Statistics
-# ============================================================================
+    final_labels[outlier_indices] = dbscan_labels_offset
+else:
+    n_dbscan_clusters = 0
+    n_dbscan_outliers = 0
+    print("No outliers remaining after KNN voting")
 
 n_final_outliers = (final_labels == -1).sum()
-n_total_clusters = len(set(final_labels)) - (1 if -1 in final_labels else 0)
+
+# ============================================================================
+# STEP 4: Generate Topic Names for All Clusters
+# ============================================================================
 
 print("\n" + "="*80)
-print("FINAL CLUSTERING RESULTS")
+print("STEP 4: GENERATING TOPIC NAMES")
 print("="*80)
-print(f"Total incidents: {len(final_labels)}")
-print(f"Total clusters: {n_total_clusters}")
-print(f"Final outliers: {n_final_outliers} ({n_final_outliers/len(final_labels)*100:.2f}%)")
+
+from sklearn.feature_extraction.text import CountVectorizer
+
+vectorizer_model = CountVectorizer(stop_words="english", min_df=1, ngram_range=(1, 2))
+
+# Get all unique cluster IDs (excluding outliers)
+unique_clusters = sorted([c for c in set(final_labels) if c != -1])
+
+print(f"Generating topic names for {len(unique_clusters)} clusters...")
+
+# Group documents by cluster
+topic_docs = {}
+for idx, cluster_id in enumerate(final_labels):
+    if cluster_id != -1:
+        if cluster_id not in topic_docs:
+            topic_docs[cluster_id] = []
+        topic_docs[cluster_id].append(descriptions[idx])
+
+# Extract keywords for each cluster
+words_per_topic = {}
+for cluster_id in unique_clusters:
+    docs = topic_docs.get(cluster_id, [])
+    
+    if len(docs) > 0:
+        topic_text = ' '.join(docs)
+        
+        try:
+            word_freq = vectorizer_model.fit_transform([topic_text])
+            feature_names = vectorizer_model.get_feature_names_out()
+            frequencies = word_freq.toarray()[0]
+            top_indices = frequencies.argsort()[-10:][::-1]
+            top_words = [feature_names[i] for i in top_indices if frequencies[i] > 0]
+            words_per_topic[cluster_id] = top_words if len(top_words) > 0 else ['unknown']
+        except:
+            words_per_topic[cluster_id] = ['unknown']
+
+print(f"Generated topic names for all {len(unique_clusters)} clusters")
+
+# Create topic names
+topic_names = {}
+for cluster_id, words in words_per_topic.items():
+    topic_names[cluster_id] = '_'.join(words[:3])
+
+# Identify cluster sources
+cluster_sources = {}
+for cluster_id in unique_clusters:
+    if cluster_id <= max_hdbscan_label:
+        cluster_sources[cluster_id] = 'HDBSCAN'
+    else:
+        cluster_sources[cluster_id] = 'DBSCAN'
+
+# Calculate probabilities
+probabilities = np.zeros(len(final_labels))
+for cluster_id in unique_clusters:
+    mask = final_labels == cluster_id
+    if mask.sum() > 0:
+        cluster_center = embeddings_reduced[mask].mean(axis=0)
+        distances_to_center = np.linalg.norm(embeddings_reduced[mask] - cluster_center, axis=1)
+        max_dist = distances_to_center.max() if distances_to_center.max() > 0 else 1
+        probabilities[mask] = 1 - (distances_to_center / max_dist * 0.5)
+
+# ============================================================================
+# STEP 5: Add Results to DataFrame
+# ============================================================================
+
+df['cluster_id'] = final_labels
+df['cluster_probability'] = probabilities
+df['cluster_name'] = df['cluster_id'].map(lambda x: topic_names.get(x, 'outlier'))
+df['cluster_source'] = df['cluster_id'].map(lambda x: cluster_sources.get(x, 'outlier'))
+
+# ============================================================================
+# STEP 6: Generate Statistics
+# ============================================================================
+
+print("\n" + "="*80)
+print("GENERATING CLUSTER STATISTICS")
+print("="*80)
+
+cluster_stats = []
+for cluster_id in unique_clusters:
+    cluster_docs = df[df['cluster_id'] == cluster_id]
+    
+    topic_keywords = ' | '.join(words_per_topic.get(cluster_id, ['N/A'])[:10])
+    
+    stats = {
+        'cluster_id': cluster_id,
+        'cluster_name': topic_names.get(cluster_id, 'unknown'),
+        'cluster_source': cluster_sources.get(cluster_id, 'unknown'),
+        'topic_words': topic_keywords,
+        'count': len(cluster_docs),
+        'avg_probability': cluster_docs['cluster_probability'].mean(),
+        'avg_alert_count': cluster_docs['alert_count'].mean(),
+        'unique_services': cluster_docs['bp_impacted_service'].nunique(),
+        'unique_business_streams': cluster_docs['business_stream_name'].nunique(),
+        'sample_descriptions': ' | '.join(cluster_docs['bp_description_cleaned'].head(2).tolist())
+    }
+    cluster_stats.append(stats)
+
+cluster_stats_df = pd.DataFrame(cluster_stats)
+
+# ============================================================================
+# STEP 7: Save Results
+# ============================================================================
+
+print("\nSaving results...")
+
+output_dir = Path('clusters')
+output_dir.mkdir(exist_ok=True)
+
+# Save summary
+cluster_stats_df.to_csv(output_dir / 'cluster_summary.csv', index=False)
+
+# Save complete data
+df.to_csv(output_dir / 'all_incidents_clustered.csv', index=False)
+
+# Save individual cluster files
+print("\nCreating individual cluster files...")
+for cluster_id in unique_clusters:
+    cluster_df = df[df['cluster_id'] == cluster_id]
+    
+    if len(cluster_df) > 0:
+        topic_name = topic_names.get(cluster_id, f'cluster_{cluster_id}')
+        source = cluster_sources.get(cluster_id, 'unknown')
+        clean_name = topic_name.replace(' ', '_').replace('/', '_')[:50]
+        filename = f'cluster_{cluster_id}_{source}_{clean_name}.csv'
+        cluster_df.to_csv(output_dir / filename, index=False)
+        print(f"  {filename}: {len(cluster_df)} incidents")
+
+# Save outliers to outliers.csv
+if n_final_outliers > 0:
+    outliers_df = df[df['cluster_id'] == -1]
+    outliers_df.to_csv(output_dir / 'outliers.csv', index=False)
+    print(f"\nSaved {len(outliers_df)} final outliers to outliers.csv")
+
+# ============================================================================
+# STEP 8: Display Final Summary
+# ============================================================================
+
+print("\n" + "="*80)
+print("FINAL CLUSTERING SUMMARY")
+print("="*80)
+print(f"Total incidents: {len(df)}")
+
+print(f"\nProcessing Flow:")
+print(f"  1. HDBSCAN: {n_hdbscan_clusters} clusters, {n_hdbscan_outliers} outliers")
+print(f"  2. KNN Voting: Assigned {n_hdbscan_outliers - n_outliers_for_dbscan} outliers")
+print(f"  3. DBSCAN: {n_dbscan_clusters} new clusters from {n_outliers_for_dbscan} remaining outliers")
+print(f"  4. Final outliers: {n_final_outliers} ({n_final_outliers/len(df)*100:.2f}%)")
+
+print(f"\nFinal Results:")
+print(f"  Total clusters: {len(unique_clusters)}")
+print(f"    - HDBSCAN clusters: {n_hdbscan_clusters}")
+print(f"    - DBSCAN clusters: {n_dbscan_clusters}")
+print(f"  Final outliers: {n_final_outliers}")
 
 cluster_sizes = pd.Series(final_labels[final_labels != -1]).value_counts()
 print(f"\nCluster size statistics:")
@@ -281,121 +391,22 @@ print(f"  Largest cluster: {cluster_sizes.max()}")
 print(f"  Average cluster size: {cluster_sizes.mean():.2f}")
 print(f"  Median cluster size: {cluster_sizes.median():.0f}")
 
-# ============================================================================
-# STEP 9: Create Topic Labels with BERTopic
-# ============================================================================
+# Show breakdown by source
+hdbscan_clusters_df = cluster_stats_df[cluster_stats_df['cluster_source'] == 'HDBSCAN']
+dbscan_clusters_df = cluster_stats_df[cluster_stats_df['cluster_source'] == 'DBSCAN']
 
-print("\nCreating topic labels...")
+print(f"\nHDBSCAN clusters: {len(hdbscan_clusters_df)} clusters, {hdbscan_clusters_df['count'].sum()} incidents")
+if len(dbscan_clusters_df) > 0:
+    print(f"DBSCAN clusters: {len(dbscan_clusters_df)} clusters, {dbscan_clusters_df['count'].sum()} incidents")
 
-from sklearn.feature_extraction.text import CountVectorizer
-
-vectorizer_model = CountVectorizer(stop_words="english", min_df=1, ngram_range=(1, 2))
-
-topic_docs = {}
-for idx, topic in enumerate(final_labels):
-    if topic != -1:
-        if topic not in topic_docs:
-            topic_docs[topic] = []
-        topic_docs[topic].append(descriptions[idx])
-
-words_per_topic = {}
-for topic_id, docs in topic_docs.items():
-    if len(docs) > 0:
-        topic_text = ' '.join(docs)
-        try:
-            word_freq = vectorizer_model.fit_transform([topic_text])
-            feature_names = vectorizer_model.get_feature_names_out()
-            frequencies = word_freq.toarray()[0]
-            top_indices = frequencies.argsort()[-10:][::-1]
-            top_words = [feature_names[i] for i in top_indices if frequencies[i] > 0]
-            words_per_topic[topic_id] = top_words if len(top_words) > 0 else ['unknown']
-        except:
-            words_per_topic[topic_id] = ['unknown']
-
-# Calculate probabilities
-probabilities = np.zeros(len(final_labels))
-for topic_id in set(final_labels):
-    if topic_id != -1:
-        mask = final_labels == topic_id
-        if mask.sum() > 0:
-            cluster_center = embeddings_reduced[mask].mean(axis=0)
-            distances = np.linalg.norm(embeddings_reduced[mask] - cluster_center, axis=1)
-            max_dist = distances.max() if distances.max() > 0 else 1
-            probabilities[mask] = 1 - (distances / max_dist * 0.5)
-
-# ============================================================================
-# STEP 10: Save Results
-# ============================================================================
-
-df['cluster_id'] = final_labels
-df['cluster_probability'] = probabilities
-
-topic_names = {}
-for topic_id, words in words_per_topic.items():
-    topic_names[topic_id] = '_'.join(words[:3])
-
-df['cluster_name'] = df['cluster_id'].map(lambda x: topic_names.get(x, 'outlier'))
-
-print("\nSaving results...")
-
-output_dir = Path('clusters')
-output_dir.mkdir(exist_ok=True)
-
-unique_topics = sorted([t for t in df['cluster_id'].unique() if t != -1])
-
-cluster_stats = []
-for cluster_id in unique_topics:
-    cluster_docs = df[df['cluster_id'] == cluster_id]
-    
-    topic_keywords = ' | '.join(words_per_topic.get(cluster_id, ['N/A'])[:10])
-    
-    stats = {
-        'cluster_id': cluster_id,
-        'cluster_name': topic_names.get(cluster_id, 'unknown'),
-        'topic_words': topic_keywords,
-        'count': len(cluster_docs),
-        'avg_probability': cluster_docs['cluster_probability'].mean(),
-        'avg_alert_count': cluster_docs['alert_count'].mean(),
-        'unique_services': cluster_docs['bp_impacted_service'].nunique(),
-        'unique_business_streams': cluster_docs['business_stream_name'].nunique(),
-        'sample_descriptions': ' | '.join(cluster_docs['bp_description_cleaned'].head(3).tolist())
-    }
-    cluster_stats.append(stats)
-
-cluster_stats_df = pd.DataFrame(cluster_stats)
-cluster_stats_df.to_csv(output_dir / 'cluster_summary.csv', index=False)
-df.to_csv(output_dir / 'all_incidents_clustered.csv', index=False)
-
-# Save individual cluster files
-print("\nCreating individual cluster files...")
-for cluster_id in unique_topics:
-    cluster_df = df[df['cluster_id'] == cluster_id]
-    
-    if len(cluster_df) > 0:
-        topic_name = topic_names.get(cluster_id, f'topic_{cluster_id}')
-        clean_name = topic_name.replace(' ', '_').replace('/', '_')[:50]
-        filename = f'cluster_{cluster_id}_{clean_name}.csv'
-        cluster_df.to_csv(output_dir / filename, index=False)
-
-if n_final_outliers > 0:
-    outliers_df = df[df['cluster_id'] == -1]
-    outliers_df.to_csv(output_dir / 'cluster_outliers.csv', index=False)
-
-# ============================================================================
-# STEP 11: Display Summary
-# ============================================================================
-
-print("\n" + "="*80)
-print("SUMMARY")
-print("="*80)
-print(f"Total incidents: {len(df)}")
-print(f"Total clusters: {n_total_clusters}")
-print(f"Final outliers: {n_final_outliers} ({n_final_outliers/len(df)*100:.2f}%)")
-
-print(f"\nTop 20 Clusters:")
+print(f"\nTop 20 Largest Clusters:")
 print(cluster_stats_df.nlargest(20, 'count')[
-    ['cluster_id', 'cluster_name', 'count']
+    ['cluster_id', 'cluster_source', 'cluster_name', 'count']
 ].to_string(index=False))
+
+if n_dbscan_clusters > 0:
+    print(f"\nDBSCAN-created clusters (from remaining outliers):")
+    print(dbscan_clusters_df[['cluster_id', 'cluster_name', 'count']].to_string(index=False))
 
 print(f"\nResults saved to: {output_dir}/")
 print("="*80)
